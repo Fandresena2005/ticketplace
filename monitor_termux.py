@@ -15,55 +15,136 @@ CONFIG = {
     "email_from": "fandresenarakotomandimby@gmail.com",
     "email_password": "bmfs umdl nxbz kjwj",
     "email_to": "fandresenarakotomandimby@gmail.com",
-    "seen_file": os.path.join(SCRIPT_DIR, "seen_test.json"),
+    "seen_events_file": os.path.join(SCRIPT_DIR, "seen_events.json"),
+    "notified_important_file": os.path.join(SCRIPT_DIR, "notified_important.json"),
     "interval_seconds": 30,
+    "retry_on_error_seconds": 10,  # réessaie après 10s si erreur réseau
+    "important_keywords": [
+        "cgm", "examen", "concours", "inscription",
+        "formation", "goethe", "delf", "dalf", "tef"
+    ]
 }
 
-URL = "https://www.reddit.com/r/worldnews/new.json?limit=5"
-HEADERS = {"User-Agent": "TicketplaceTestMonitor/1.0"}
+HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "fr-FR,fr;q=0.9",
+    "origin": "https://www.ticketplace.io",
+    "referer": "https://www.ticketplace.io/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+}
+
+API_URLS = [
+    ("https://web-api.ticketplace.io/api/events/upcoming-events?search=undefined", "upcoming"),
+    ("https://web-api.ticketplace.io/api/events/passed-events", "passed"),
+]
+
+# Session persistante avec cloudscraper
+try:
+    import cloudscraper
+    session = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    print("✅ cloudscraper chargé")
+except ImportError:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    print("⚠️  cloudscraper absent, utilisation de requests")
 
 
-def load_seen():
-    if os.path.exists(CONFIG["seen_file"]):
-        with open(CONFIG["seen_file"], "r") as f:
+# -------------------------
+# PERSISTENCE
+# -------------------------
+def load_json_set(filepath):
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
             return set(json.load(f))
     return set()
 
 
-def save_seen(seen):
-    with open(CONFIG["seen_file"], "w") as f:
-        json.dump(list(seen), f)
+def save_json_set(filepath, data):
+    with open(filepath, "w") as f:
+        json.dump(list(data), f)
 
 
-def fetch_posts():
-    posts = {}
-    try:
-        r = requests.get(URL, headers=HEADERS, timeout=15)
-        print(f"   Status: {r.status_code}")
-        if r.status_code != 200:
-            return posts
-        items = r.json()["data"]["children"]
-        for item in items:
-            d = item["data"]
-            posts[d["id"]] = {
-                "id":       d["id"],
-                "title":    d["title"],
-                "url":      f"https://reddit.com{d['permalink']}",
-                "found_at": datetime.now().strftime("%H:%M:%S"),
-            }
-            print(f"   📰 {d['title'][:60]}")
-    except Exception as e:
-        print(f"   ❌ Erreur: {e}")
-    return posts
+# -------------------------
+# KEYWORD CHECK
+# -------------------------
+def is_important(text):
+    return any(k in text.lower() for k in CONFIG["important_keywords"])
 
 
-def send_email(new_posts):
-    subject = f"🆕 {len(new_posts)} nouveaux posts Reddit — TEST MONITOR"
-    html = "<h2>🧪 Test Monitor — Reddit r/worldnews</h2><h3>🆕 Nouveaux posts</h3>"
-    for p in new_posts:
-        html += f"""<div style='border-left:4px solid #0066cc;padding:8px 12px;margin:8px 0;'>
-            <a href='{p["url"]}'>{p["title"]}</a><br>
-            <small>Détecté à {p["found_at"]}</small></div>"""
+# -------------------------
+# FETCH AVEC RETRY
+# -------------------------
+def fetch_events():
+    events = {}
+    for url, label in API_URLS:
+        retries = 3
+        for attempt in range(retries):
+            try:
+                r = session.get(url, headers=HEADERS, timeout=15)
+                print(f"   [{label}] Status: {r.status_code}")
+                if r.status_code not in (200, 304):
+                    print(f"   [{label}] ⚠️ Ignoré")
+                    break
+                items = r.json().get("data", [])
+                print(f"   [{label}] 📊 {len(items)} événements")
+                for item in items:
+                    eid   = str(item["id"])
+                    title = item.get("title", "").strip()
+                    if not title:
+                        continue
+                    events[eid] = {
+                        "id":        eid,
+                        "text":      title,
+                        "url":       f"https://www.ticketplace.io/event/{item.get('eventHashCode', eid)}",
+                        "startDate": item.get("startDate", ""),
+                        "endDate":   item.get("endDate", ""),
+                        "location":  item.get("location", ""),
+                        "category":  item.get("category", ""),
+                        "type":      label,
+                        "important": is_important(title),
+                        "found_at":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    }
+                break  # succès, on sort du retry
+
+            except requests.exceptions.ConnectionError:
+                print(f"   [{label}] ❌ Pas de connexion (tentative {attempt+1}/{retries})")
+                if attempt < retries - 1:
+                    time.sleep(CONFIG["retry_on_error_seconds"])
+            except Exception as e:
+                print(f"   [{label}] ❌ Erreur: {e}")
+                break
+
+    return events
+
+
+# -------------------------
+# EMAIL
+# -------------------------
+def send_email(new_events, important_events):
+    subject = f"🎫 {len(new_events)} nouveaux | 🔥 {len(important_events)} importants — Ticketplace"
+    html = f"<h2>🎫 Surveillance Ticketplace</h2>"
+    html += f"<p style='color:gray'>Détecté le {datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}</p>"
+
+    if important_events:
+        html += "<h3 style='color:red;'>🔥 IMPORTANTS</h3>"
+        for e in important_events:
+            icon = "📅" if e["type"] == "upcoming" else "✅"
+            html += f"""<div style='border-left:4px solid red;padding:8px 12px;margin:8px 0;'>
+                {icon} <b><a href='{e["url"]}'>{e["text"]}</a></b><br>
+                📍 {e["location"]}<br>
+                🗓️ {e["startDate"]} → {e["endDate"]}<br>
+                🏷️ {e["category"]}</div>"""
+
+    if new_events:
+        html += "<h3>🆕 Nouveaux</h3>"
+        for e in new_events:
+            icon = "📅" if e["type"] == "upcoming" else "✅"
+            flag = " 🔥" if e["important"] else ""
+            html += f"""<div style='border-left:4px solid #0066cc;padding:8px 12px;margin:8px 0;'>
+                {icon}{flag} <a href='{e["url"]}'>{e["text"]}</a><br>
+                📍 {e["location"]} — 🗓️ {e["startDate"]}</div>"""
 
     msg = MIMEMultipart()
     msg["Subject"] = subject
@@ -80,51 +161,73 @@ def send_email(new_posts):
         print(f"   ❌ Erreur email: {e}")
 
 
+# -------------------------
+# NOTIFICATION ANDROID
+# -------------------------
 def termux_notify(title, message):
     os.system(f'termux-notification --title "{title}" --content "{message}" --sound --vibrate 1000 --priority high')
 
 
+# -------------------------
+# MAIN
+# -------------------------
 def main():
     print("=" * 50)
-    print("🧪 TEST MONITOR — Reddit r/worldnews")
+    print("🚀 Monitor Ticketplace — mode boucle Termux")
     print(f"⏱️  Intervalle: {CONFIG['interval_seconds']}s")
     print("🛑  Ctrl+C pour arrêter")
     print("=" * 50)
 
-    seen  = load_seen()
+    seen               = load_json_set(CONFIG["seen_events_file"])
+    notified_important = load_json_set(CONFIG["notified_important_file"])
     cycle = 0
 
     while True:
         cycle += 1
-        now = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now().strftime("%d/%m %H:%M:%S")
         print(f"\n[{now}] 🔄 Cycle #{cycle}")
 
         try:
-            posts = fetch_posts()
-            print(f"   📊 {len(posts)} posts trouvés")
+            events = fetch_events()
+            print(f"   📊 Total: {len(events)} événements")
 
-            new_posts = []
-            for pid, p in posts.items():
-                if pid not in seen:
-                    new_posts.append(p)
-                    print(f"   🆕 NOUVEAU: {p['title'][:50]}")
+            new_events       = []
+            important_events = []
 
-            if new_posts:
-                print(f"   🆕 {len(new_posts)} nouveaux !")
-                send_email(new_posts)
-                termux_notify("🆕 Nouveau post Reddit", f"{len(new_posts)} nouveaux posts détectés")
+            for eid, e in events.items():
+                # Nouveau = jamais vu
+                if eid not in seen:
+                    new_events.append(e)
+                    print(f"   🆕 NOUVEAU: {e['text']}")
+
+                # Important = jamais notifié (évite les doublons)
+                if e["important"] and eid not in notified_important:
+                    important_events.append(e)
+                    print(f"   🔥 IMPORTANT: {e['text']}")
+
+            if new_events or important_events:
+                send_email(new_events, important_events)
+                termux_notify(
+                    "🎫 Ticketplace",
+                    f"🆕 {len(new_events)} nouveaux | 🔥 {len(important_events)} importants"
+                )
+                # Marquer les importants comme notifiés
+                for e in important_events:
+                    notified_important.add(e["id"])
+                save_json_set(CONFIG["notified_important_file"], notified_important)
             else:
                 print("   😐 Rien de nouveau")
 
-            for pid in posts:
-                seen.add(pid)
-            save_seen(seen)
+            # Marquer tous comme vus
+            for eid in events:
+                seen.add(eid)
+            save_json_set(CONFIG["seen_events_file"], seen)
 
         except KeyboardInterrupt:
-            print("\n🛑 Arrêté")
+            print("\n🛑 Arrêté par l'utilisateur")
             break
         except Exception as e:
-            print(f"   ❌ Erreur: {e}")
+            print(f"   ❌ Erreur inattendue: {e}")
 
         time.sleep(CONFIG["interval_seconds"])
 
