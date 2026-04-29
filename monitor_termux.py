@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 monitor_ticketplace.py
-Surveillance des événements Ticketplace avec bypass Cloudflare via curl_cffi.
+Surveillance ULTRA-RAPIDE des événements Ticketplace.
+Mode sniper : vérifie toutes les 3 secondes, alerte instantanée.
 Compatible Termux (Android) et Linux.
 """
 
@@ -22,11 +23,18 @@ CONFIG = {
     "email_to": "fandresenarakotomandimby@gmail.com",
     "seen_events_file": os.path.join(SCRIPT_DIR, "seen_events.json"),
     "notified_important_file": os.path.join(SCRIPT_DIR, "notified_important.json"),
-    "interval_seconds": 30,
-    "retry_on_error_seconds": 10,
+
+    # ⚡ INTERVALLES : mode normal vs mode alerte active
+    "interval_seconds": 5,          # vérification normale toutes les 5s
+    "interval_alert_seconds": 2,    # vérification accélérée à 2s si événement détecté récemment
+    "alert_boost_duration": 60,     # boost pendant 60s après une détection
+    "retry_on_error_seconds": 5,
+
     "important_keywords": [
         "cgm", "examen", "concours", "inscription",
-        "formation", "goethe", "delf", "dalf", "tef"
+        "formation", "goethe", "delf", "dalf", "tef",
+        "ouverture", "disponible", "places", "limitées",
+        "billet", "ticket"
     ]
 }
 
@@ -101,16 +109,10 @@ def fetch_events():
         retries = 3
         for attempt in range(retries):
             try:
-                if USE_CURL:
-                    # curl_cffi gère le TLS fingerprint automatiquement
-                    r = session.get(url, headers=HEADERS, timeout=15)
-                else:
-                    r = session.get(url, headers=HEADERS, timeout=15)
-
-                print(f"   [{label}] Status: {r.status_code}")
+                r = session.get(url, headers=HEADERS, timeout=10)
 
                 if r.status_code == 403:
-                    print(f"   [{label}] ❌ 403 Cloudflare — vérifiez que curl_cffi est installé")
+                    print(f"   [{label}] ❌ 403 Cloudflare — installez curl_cffi")
                     break
 
                 if r.status_code not in (200, 304):
@@ -118,7 +120,6 @@ def fetch_events():
                     break
 
                 items = r.json().get("data", [])
-                print(f"   [{label}] 📊 {len(items)} événements")
 
                 for item in items:
                     eid   = str(item["id"])
@@ -139,7 +140,7 @@ def fetch_events():
                     }
                 break  # succès
 
-            except (std_requests.exceptions.ConnectionError, Exception) as e:
+            except Exception as e:
                 err_type = type(e).__name__
                 if "ConnectionError" in err_type or "ConnectError" in err_type:
                     print(f"   [{label}] ❌ Pas de connexion (tentative {attempt+1}/{retries})")
@@ -157,24 +158,24 @@ def fetch_events():
 # EMAIL
 # -------------------------
 def send_email(new_events, important_events):
-    subject = f"🎫 {len(new_events)} nouveaux | 🔥 {len(important_events)} importants — Ticketplace"
-    html = "<h2>🎫 Surveillance Ticketplace</h2>"
+    subject = f"🚨 ALERTE PLACES DISPO — {len(new_events)} nouveaux | {len(important_events)} importants — Ticketplace"
+    html = "<h2>🎫 Surveillance Ticketplace — ALERTE IMMÉDIATE</h2>"
     html += f"<p style='color:gray'>Détecté le {datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}</p>"
 
     if important_events:
-        html += "<h3 style='color:red;'>🔥 IMPORTANTS</h3>"
+        html += "<h3 style='color:red;'>🔥 RÉSERVEZ MAINTENANT — ÉVÉNEMENTS IMPORTANTS</h3>"
         for e in important_events:
-            icon = "📅" if e["type"] == "upcoming" else "✅"
             html += f"""
-            <div style='border-left:4px solid red;padding:8px 12px;margin:8px 0;'>
-                {icon} <b><a href='{e["url"]}'>{e["text"]}</a></b><br>
+            <div style='border-left:4px solid red;padding:8px 12px;margin:8px 0;background:#fff5f5;'>
+                🚨 <b><a href='{e["url"]}' style='color:red;font-size:16px;'>{e["text"]}</a></b><br>
                 📍 {e["location"]}<br>
                 🗓️ {e["startDate"]} → {e["endDate"]}<br>
-                🏷️ {e["category"]}
+                🏷️ {e["category"]}<br>
+                🔗 <a href='{e["url"]}'>{e["url"]}</a>
             </div>"""
 
     if new_events:
-        html += "<h3>🆕 Nouveaux</h3>"
+        html += "<h3>🆕 Nouveaux événements</h3>"
         for e in new_events:
             icon = "📅" if e["type"] == "upcoming" else "✅"
             flag = " 🔥" if e["important"] else ""
@@ -200,40 +201,64 @@ def send_email(new_events, important_events):
 
 
 # -------------------------
-# NOTIFICATION ANDROID (Termux)
+# NOTIFICATION ANDROID (Termux) — ALERTE MAX
 # -------------------------
-def termux_notify(title, message):
-    os.system(
-        f'termux-notification '
-        f'--title "{title}" '
-        f'--content "{message}" '
-        f'--sound --vibrate 1000 --priority high'
-    )
+def termux_notify(title, message, urgent=False):
+    if urgent:
+        # Vibre 3 fois + son fort pour les événements importants
+        for _ in range(3):
+            os.system(
+                f'termux-notification '
+                f'--title "{title}" '
+                f'--content "{message}" '
+                f'--sound --vibrate 2000 --priority max --ongoing'
+            )
+            time.sleep(0.5)
+    else:
+        os.system(
+            f'termux-notification '
+            f'--title "{title}" '
+            f'--content "{message}" '
+            f'--sound --vibrate 1000 --priority high'
+        )
+
+
+def termux_toast(message):
+    """Affiche un message toast rapide sur l'écran Android."""
+    os.system(f'termux-toast -s "{message}"')
 
 
 # -------------------------
 # MAIN
 # -------------------------
 def main():
-    print("=" * 50)
-    print("🚀 Monitor Ticketplace — mode boucle Termux")
-    print(f"⏱️  Intervalle: {CONFIG['interval_seconds']}s")
+    print("=" * 55)
+    print("🚀 Monitor Ticketplace — MODE SNIPER")
+    print(f"⚡  Intervalle normal  : {CONFIG['interval_seconds']}s")
+    print(f"🔥  Intervalle boost   : {CONFIG['interval_alert_seconds']}s (après détection)")
     print(f"🔧  Backend: {'curl_cffi' if USE_CURL else 'cloudscraper/requests'}")
     print("🛑  Ctrl+C pour arrêter")
-    print("=" * 50)
+    print("=" * 55)
 
     seen               = load_json_set(CONFIG["seen_events_file"])
     notified_important = load_json_set(CONFIG["notified_important_file"])
     cycle = 0
+    last_detection_time = 0  # timestamp de la dernière détection
 
     while True:
         cycle += 1
         now = datetime.now().strftime("%d/%m %H:%M:%S")
-        print(f"\n[{now}] 🔄 Cycle #{cycle}")
+
+        # Calcul de l'intervalle dynamique
+        time_since_last = time.time() - last_detection_time
+        in_boost_mode = time_since_last < CONFIG["alert_boost_duration"]
+        current_interval = CONFIG["interval_alert_seconds"] if in_boost_mode else CONFIG["interval_seconds"]
+        boost_label = " ⚡BOOST" if in_boost_mode else ""
+
+        print(f"\n[{now}] 🔄 Cycle #{cycle}{boost_label} (prochain dans {current_interval}s)")
 
         try:
             events = fetch_events()
-            print(f"   📊 Total: {len(events)} événements")
 
             new_events       = []
             important_events = []
@@ -248,11 +273,19 @@ def main():
                     print(f"   🔥 IMPORTANT: {e['text']}")
 
             if new_events or important_events:
+                last_detection_time = time.time()  # active le mode boost
                 send_email(new_events, important_events)
+
+                # Notification urgente si événement important
+                is_urgent = len(important_events) > 0
                 termux_notify(
-                    "🎫 Ticketplace",
-                    f"🆕 {len(new_events)} nouveaux | 🔥 {len(important_events)} importants"
+                    "🚨 TICKETPLACE — NOUVELLES PLACES !",
+                    f"🆕 {len(new_events)} nouveaux | 🔥 {len(important_events)} importants — RÉSERVEZ VITE !",
+                    urgent=is_urgent
                 )
+                if is_urgent:
+                    termux_toast("🔥 ÉVÉNEMENT IMPORTANT DÉTECTÉ — OUVREZ L'APP !")
+
                 for e in important_events:
                     notified_important.add(e["id"])
                 save_json_set(CONFIG["notified_important_file"], notified_important)
@@ -269,7 +302,7 @@ def main():
         except Exception as e:
             print(f"   ❌ Erreur inattendue: {e}")
 
-        time.sleep(CONFIG["interval_seconds"])
+        time.sleep(current_interval)
 
 
 if __name__ == "__main__":
